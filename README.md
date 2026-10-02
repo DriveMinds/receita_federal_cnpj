@@ -11,31 +11,51 @@ Nesse repositório consta um processo de ETL para **i)** baixar os arquivos; **i
 ---------------------
 
 ### Infraestrutura necessária:
-- [Python 3.8](https://www.python.org/downloads/release/python-3810/)
-- [PostgreSQL 14.2](https://www.postgresql.org/download/)
+- Python 3.11+
+- PostgreSQL 14+ (testado em 16)
 
 ---------------------
 
+### Como funciona a sincronização incremental
+
+O processo antigo apagava as tabelas e recarregava tudo (horas). O `rfb_cnpj` faz o contrário: o banco é a
+linha de base e só o que mudou é gravado. Em ordem do mais barato para o mais caro:
+
+1. **Listagem (1–2 requisições).** Um `PROPFIND` WebDAV (ou a listagem HTTP + um `HEAD` por ZIP) traz tamanho, ETag e
+   data de todos os arquivos da pasta mais recente (`AAAA-MM`). Se a impressão digital de todos bate com a guardada em
+   `sync_file`, **nada é baixado** e o job termina em segundos. É isso que torna viável rodar todo dia.
+2. **Assinatura do ZIP (1 requisição `Range` de ~64 KB por ZIP alterado).** Lê só o diretório central do ZIP remoto
+   (CRC32 + tamanho de cada membro). Se o conteúdo é o mesmo (arquivo apenas republicado), não baixa nada.
+3. **Download só do que mudou**, com retomada (`Range`/`If-Range`), `.part` + conferência de tamanho, no máximo 2
+   conexões, intervalo mínimo entre requisições e backoff com `Retry-After` em 429/5xx.
+4. **Diff direto no PostgreSQL.** O CSV é lido do ZIP em streaming (sem extrair para disco) para uma tabela temporária
+   via `COPY`; um hash MD5 da linha é comparado com o `row_hash` gravado: `INSERT … ON CONFLICT DO UPDATE … WHERE hash
+   diferente` só escreve linhas novas/alteradas (linhas iguais não geram versões mortas nem WAL), e um `DELETE` remove o
+   que sumiu daquela parte. Cada ZIP é uma transação única, que também grava o estado: ou tudo entra, ou nada.
+5. **Verificação.** Ao fim de cada ZIP, `count(*)` das linhas daquela parte no banco precisa ser igual ao número de
+   linhas distintas do arquivo, senão a transação é revertida. `python -m rfb_cnpj verify` confere as tabelas inteiras.
+
+> Os dados são publicados como um *snapshot* mensal. Na prática o diff diário quase sempre diz "nada mudou"; uma vez
+> por mês quase todos os ZIPs mudam e é preciso baixá-los (o servidor não permite baixar “só a diferença” de um ZIP,
+> pois a compressão deflate não tem acesso aleatório). Nesse dia o ganho está em não reescrever o banco inteiro.
+
 ### How to use:
-1. Com o Postgres instalado, inicie a instância do servidor (pode ser local) e crie o banco de dados conforme o arquivo `banco_de_dados.sql`.
-
-2. Crie um arquivo `.env` no diretório `code`, conforme as variáveis de ambiente do seu ambiente de trabalho (localhost). Utilize como referência o arquivo `.env_template`. Você pode também, por exemplo, renomear o arquivo de `.env_template` para apenas `.env` e então utilizá-lo:
-   - `OUTPUT_FILES_PATH`: diretório de destino para o donwload dos arquivos
-   - `EXTRACTED_FILES_PATH`: diretório de destino para a extração dos arquivos .zip
-   - `DB_USER`: usuário do banco de dados criado pelo arquivo `banco_de_dados.sql`
-   - `DB_PASSWORD`: senha do usuário do BD
-   - `DB_HOST`: host da conexão com o BD
-   - `DB_PORT`: porta da conexão com o BD
-   - `DB_NAME`: nome da base de dados na instância (`Dados_RFB` - conforme arquivo `banco_de_dados.sql`)
-
-3. Instale as bibliotecas necessárias, disponíveis em `requirements.txt`:
 ```
 pip install -r requirements.txt
+cp .env.example .env                    # ajuste banco/fonte
+python -m rfb_cnpj init                 # cria schema, tabelas e tabelas de estado
+python -m rfb_cnpj check                # barato: sai com código 10 se há mudanças pendentes
+python -m rfb_cnpj sync                 # baixa o que mudou e aplica o diff
+python -m rfb_cnpj verify               # confere contagens
+python -m rfb_cnpj status
 ```
+Agendamento diário (cron): `15 6 * * * cd /app && python -m rfb_cnpj sync >> sync.log 2>&1`.
+`--only empresa socios` limita as tabelas; `--force` ignora o estado (ainda aplica só o diff); `--prune` remove dados de
+ZIPs que deixaram de existir no servidor. Testes: `pytest` (usa `TEST_DSN`, um PostgreSQL descartável).
 
-4. Execute o arquivo `ETL_coletar_dados_e_gravar_BD.py` e aguarde a finalização do processo.
-   - Os arquivos são grandes. Dependendo da infraestrutura isso deve levar muitas horas para conclusão.
-   - Arquivos de 08/05/2021: `4,68 GB` compactados e `17,1 GB` descompactados.
+Tabelas ficam no schema `cnpj` (configurável). Cada linha tem `row_hash` e `src` (índice da parte do ZIP de origem).
+Datas viram `date` (`0`/`00000000`/inválidas → `NULL`), `capital_social` vira `numeric`, e códigos com zeros à esquerda
+(CNAE, CEP, CNPJ) permanecem texto. `socios` não tem chave natural; sua identidade é o hash do conteúdo.
 
 ---------------------
 
